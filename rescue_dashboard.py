@@ -265,21 +265,25 @@ with st.sidebar:
     dynamic_sidebar = st.container()
 
 # --- FRAGMENT (Auto-refresh every 15 seconds) ---
-if not df_active.empty and "🚨 Required Team" in df_active.columns:
-    active_heli = len(df_active[df_active["🚨 Required Team"].str.contains("Heli|Evac", na=False, case=False)])
-    active_boat = len(df_active[df_active["🚨 Required Team"].str.contains("Boat|Swift", na=False, case=False)])
-    active_medic = len(df_active[df_active["🚨 Required Team"].str.contains("ALS|BLS|Medic", na=False, case=False)])
-    active_4x4 = len(df_active[df_active["🚨 Required Team"].str.contains("4x4", na=False, case=False)])
-else:
-    # If no one is active, default all counts to 0
-    active_heli = 0
-    active_boat = 0
-    active_medic = 0
-    active_4x4 = 0
+@st.fragment(run_every="15s")
+def render_live_dashboard():
+    rescue_df = get_cloud_data()
+
+    df_pending = rescue_df[rescue_df['Status'].isin(['Pending Rescue', 'Pending', 'Awaiting'])].copy() if not rescue_df.empty else pd.DataFrame()
+    df_active = rescue_df[rescue_df['Status'] == 'Sent/En Route'].copy() if not rescue_df.empty else pd.DataFrame()
+    df_completed = rescue_df[rescue_df['Status'].isin(['Rescued ✅', 'Resolved - Safe'])].copy() if not rescue_df.empty else pd.DataFrame()
+
+    # --- DYNAMIC RESOURCES CALCULATION (Capacity Fix) ---
+    if not df_active.empty and "🚨 Required Team" in df_active.columns:
+        active_heli = len(df_active[df_active["🚨 Required Team"].str.contains("Heli|Evac", na=False, case=False)])
+        active_boat = len(df_active[df_active["🚨 Required Team"].str.contains("Boat|Swift", na=False, case=False)])
+        active_medic = len(df_active[df_active["🚨 Required Team"].str.contains("ALS|BLS|Medic", na=False, case=False)])
+        active_4x4 = len(df_active[df_active["🚨 Required Team"].str.contains("4x4", na=False, case=False)])
+    else:
+        active_heli, active_boat, active_medic, active_4x4 = 0, 0, 0, 0
 
     base_heli, base_boat, base_medic, base_4x4 = 3, 8, 6, 12
 
-    # Calculate remaining idle units
     idle_heli = max(0, base_heli - active_heli)
     idle_boat = max(0, base_boat - active_boat)
     idle_medic = max(0, base_medic - active_medic)
@@ -315,7 +319,7 @@ else:
 
     st.subheader("🚨 1. Pending Missions (Needs Dispatch)")
     if not df_pending.empty:
-        # Set index to Doc_ID to prevent data_editor from resetting checkboxes on refresh
+        # Prevent jumpy checkboxes during refresh by pinning Doc_ID as index
         df_pending = df_pending.set_index("Doc_ID", drop=False)
         
         offline_csv = df_pending.drop(columns=['Doc_ID']).to_csv(index=False).encode('utf-8')
@@ -357,7 +361,7 @@ else:
                 else:
                     with st.spinner("Checking capacity and transmitting dispatch orders..."):
                         try:
-                            # Prioritize missions: P0 first, then P1, P2, P3
+                            # Triage by Priority for deployment queue
                             priority_map = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
                             selected_rows = df_pending[df_pending["Doc_ID"].isin(selected_pending_docs)].copy()
                             selected_rows["prio_val"] = selected_rows["Priority"].map(priority_map).fillna(99)
@@ -365,31 +369,20 @@ else:
 
                             batch = db.batch()
                             timestamp_now = datetime.now(MY_TZ).strftime("%Y-%m-%d %H:%M:%S")
-                            
-                            deployed_count = 0
-                            skipped_count = 0
+                            deployed_count, skipped_count = 0, 0
 
                             for _, row in selected_rows.iterrows():
-                                req_team = row["🚨 Required Team"]
-                                doc_id = row["Doc_ID"]
-                                ic_val = row["IC / ID"]
+                                req_team, doc_id, ic_val = row["🚨 Required Team"], row["Doc_ID"], row["IC / ID"]
 
-                                # Determine needed units for this mission
                                 needs_heli = 1 if "Heli" in req_team or "Evac" in req_team else 0
                                 needs_boat = 1 if "Boat" in req_team or "Swift" in req_team else 0
                                 needs_medic = 1 if "ALS" in req_team or "BLS" in req_team or "Medic" in req_team else 0
                                 needs_4x4 = 1 if "4x4" in req_team else 0
 
-                                # Check if we have enough idle capacity
                                 if (idle_heli >= needs_heli and idle_boat >= needs_boat and 
                                     idle_medic >= needs_medic and idle_4x4 >= needs_4x4):
                                     
-                                    # Deduct from available capacity
-                                    idle_heli -= needs_heli
-                                    idle_boat -= needs_boat
-                                    idle_medic -= needs_medic
-                                    idle_4x4 -= needs_4x4
-
+                                    idle_heli, idle_boat, idle_medic, idle_4x4 = idle_heli-needs_heli, idle_boat-needs_boat, idle_medic-needs_medic, idle_4x4-needs_4x4
                                     doc_ref = db.collection("rescue_missions").document(doc_id)
                                     batch.update(doc_ref, {
                                         "status": "Sent/En Route",
@@ -401,12 +394,8 @@ else:
                                     skipped_count += 1
 
                             batch.commit()
-                            
-                            if deployed_count > 0:
-                                st.toast(f"✅ {deployed_count} Teams Deployed based on Priority!")
-                            if skipped_count > 0:
-                                st.warning(f"⚠️ {skipped_count} missions skipped/delayed due to insufficient Rescue Units.")
-                                
+                            if deployed_count > 0: st.toast(f"✅ {deployed_count} Teams Deployed based on Priority!")
+                            if skipped_count > 0: st.warning(f"⚠️ {skipped_count} missions delayed due to lack of units.")
                             st.rerun() 
                         except Exception as e:
                             st.error("Failed to dispatch due to network or sync error.")
@@ -417,9 +406,7 @@ else:
 
     st.subheader("🚁 2. Active Deployments (En Route)")
     if not df_active.empty:
-        # Set index to Doc_ID to prevent data_editor from resetting checkboxes on refresh
         df_active = df_active.set_index("Doc_ID", drop=False)
-        
         df_active.insert(0, "✅ Rescued", False)
         
         select_all_active = st.checkbox("☑️ Select All Active Deployments", key="select_all_active")
@@ -460,7 +447,7 @@ else:
                             timestamp_now = datetime.now(MY_TZ).strftime("%Y-%m-%d %H:%M:%S")
                             for doc_id in selected_active_docs:
                                 doc_ref = db.collection("rescue_missions").document(doc_id)
-                                ic_val = df_active[df_active["Doc_ID"] == doc_id]["IC / ID"].iloc[0]
+                                ic_val = df_active.loc[doc_id, "IC / ID"]
                                 batch.update(doc_ref, {
                                     "status": "Rescued ✅",
                                     "ic": str(ic_val),
@@ -493,46 +480,19 @@ else:
     st.subheader("📍 Interactive Deployment Map")
     if not rescue_df.empty:
         map_data = rescue_df[['IC / ID', 'lat', 'lon', 'Status', 'Priority', '🚨 Required Team']].copy()
-        
         map_data = map_data.dropna(subset=['lat', 'lon'])
         
         def get_map_color(status):
-            if status in ['Pending Rescue', 'Pending', 'Awaiting']: 
-                return [255, 75, 75, 200] 
-            elif status in ['Sent/En Route']: 
-                return [77, 171, 247, 200] 
-            else: 
-                return [85, 85, 85, 100] 
+            if status in ['Pending Rescue', 'Pending', 'Awaiting']: return [255, 75, 75, 200] 
+            elif status in ['Sent/En Route']: return [77, 171, 247, 200] 
+            else: return [85, 85, 85, 100] 
                 
         map_data['color_rgba'] = map_data['Status'].apply(get_map_color)
-        
-        layer = pdk.Layer(
-            'ScatterplotLayer',
-            data=map_data,
-            get_position='[lon, lat]',
-            get_color='color_rgba',
-            get_radius=300,
-            pickable=True
-        )
-        
-        avg_lat = map_data['lat'].mean() if not map_data.empty else 3.1390
-        avg_lon = map_data['lon'].mean() if not map_data.empty else 101.6869
-        
-        view_state = pdk.ViewState(
-            latitude=avg_lat, 
-            longitude=avg_lon, 
-            zoom=11, 
-            pitch=0
-        )
-        
-        r = pdk.Deck(
-            layers=[layer], 
-            initial_view_state=view_state, 
-            tooltip={"text": "ID: {IC / ID}\nStatus: {Status}\nPriority: {Priority}\nTeam: {🚨 Required Team}"}
-        )
-        
+        layer = pdk.Layer('ScatterplotLayer', data=map_data, get_position='[lon, lat]', get_color='color_rgba', get_radius=300, pickable=True)
+        avg_lat, avg_lon = map_data['lat'].mean() if not map_data.empty else 3.1390, map_data['lon'].mean() if not map_data.empty else 101.6869
+        view_state = pdk.ViewState(latitude=avg_lat, longitude=avg_lon, zoom=11, pitch=0)
+        r = pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip={"text": "ID: {IC / ID}\nStatus: {Status}\nPriority: {Priority}\nTeam: {🚨 Required Team}"})
         st.pydeck_chart(r)
-        
         st.markdown("""
         <div style="background-color: #161b22; padding: 15px; border-radius: 10px; border: 1px solid #30363d; font-size: 14px;">
             <b>🗺️ Map Legend (Hover over dots for AI Intel):</b><br><br>
