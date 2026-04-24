@@ -10,7 +10,7 @@ import pydeck as pdk
 # --- 1. PAGE CONFIG & STYLING ---
 st.set_page_config(page_title="Z.AI Rescue Command", page_icon="🚁", layout="wide")
 
-# Database Connection Caching (Prevent duplicate connections)
+# Database Connection Caching
 @st.cache_resource
 def init_db():
     if not firebase_admin._apps:
@@ -29,10 +29,10 @@ def init_db():
 
 db = init_db()
 
-# Malaysia Timezone (UTC+8) setup
+# Malaysia Timezone
 MY_TZ = timezone(timedelta(hours=8))
 
-# Custom CSS for Command Center aesthetic 
+# Custom CSS
 st.markdown("""
     <style>
     .block-container {
@@ -102,14 +102,18 @@ def analyze_team_requirement(priority, water, medical, hazards):
 # --- HELPER: Generate Mock ID ---
 def generate_mock_ic(doc_id):
     random.seed(doc_id) 
-    year = random.randint(50, 99)
+    # 1. Date of Birth (YYMMDD)
+    year = random.randint(50, 99) if random.choice([True, False]) else random.randint(0, 5)
     month = random.randint(1, 12)
-    day = random.randint(1, 28)
-    place = random.choice(['14', '10', '01', '07', '08']) 
+    day = random.randint(1, 28) # Kept at max 28 to prevent leap year invalid dates
+        # 2. Place of Birth / State Code (PB)
+    state_codes = [f"{i:02d}" for i in range(1, 17)]
+    place = random.choice(state_codes) 
+        # 3. 4-Digit Unique Identifier (XXXX)
     last = random.randint(1000, 9999)
     return f"{year:02d}{month:02d}{day:02d}-{place}-{last}"
 
-# --- HELPER: Safely parse AI JSON or String (ULTIMATE FAILSAFE) ---
+# --- HELPER: Parse AI Intel ---
 def parse_ai_intel(ai_raw, user_note=""):
     ai_raw = str(ai_raw).strip()
     user_note_clean = str(user_note).strip().lower()
@@ -172,7 +176,9 @@ def get_cloud_data():
         for doc in docs:
             d = doc.to_dict()
             
-            ts = d.get("server_timestamp", d.get("timestamp", 0))
+            # Use client timestamp primarily to ensure offline synced packets are pushed to front
+            ts = d.get("client_timestamp", d.get("server_timestamp", d.get("timestamp", 0)))
+            
             if hasattr(ts, 'timestamp') and callable(ts.timestamp):
                 ts = ts.timestamp()
             elif isinstance(ts, datetime):
@@ -184,24 +190,19 @@ def get_cloud_data():
                 wait_hrs = wait_seconds // 3600
                 wait_mins = (wait_seconds % 3600) // 60
                 wait_secs = wait_seconds % 60
-                
-                wait_time = f"{wait_hrs}hr {wait_mins}min {wait_secs}second"
+                wait_time = f"{wait_hrs}hr {wait_mins}min"
             else:
                 time_str = d.get("time_str", "N/A")
                 wait_time = "N/A"
+                wait_seconds = 0
                 
             fetched_ic = str(d.get("ic", d.get("IC", ""))).strip()
             if fetched_ic and fetched_ic != "None":
                 display_id = fetched_ic
             else:
                 raw_id = str(d.get("mission_id", d.get("id", "")))
-                display_id = raw_id if raw_id and raw_id[0].isdigit() and len(raw_id) >= 12 else generate_mock_ic(doc.id)
+                display_id = raw_id if raw_id and raw_id[0].isdigit() == False else generate_mock_ic(doc.id)
                 
-                try:
-                    db.collection("rescue_missions").document(doc.id).update({"ic": display_id})
-                except Exception:
-                    pass
-            
             fetched_note = str(d.get("note", "-")).strip()
             ai_intel, ai_res, ai_sup = parse_ai_intel(d.get("ai_analysis", "N/A"), fetched_note)
                 
@@ -209,18 +210,20 @@ def get_cloud_data():
             water = d.get('water', d.get('env', 'N/A'))
             medical = str(d.get("medical", "None"))
             hazards = d.get('tags', 'None')
+            headcount = d.get("headcount", 1) 
             
             req_team = analyze_team_requirement(priority, water, medical, hazards)
-
             timeline_log = " | ".join(d.get("timeline", [])) if isinstance(d.get("timeline"), list) else "-"
 
             data_list.append({
                 "Doc_ID": doc.id, 
                 "IC / ID": display_id, 
                 "Role": d.get("role", "👤 Victim"),
+                "Headcount": headcount,
                 "Phone": d.get("contact", "N/A"),
                 "Reported (MYT)": time_str,
                 "Wait Time": wait_time,
+                "wait_sec_hidden": wait_seconds,
                 "Status": d.get("status", "Pending Rescue"),
                 "Priority": priority,
                 "Location": water, 
@@ -234,12 +237,29 @@ def get_cloud_data():
                 "lat": d.get("gps_lat", 3.1390),
                 "lon": d.get("gps_lng", 101.6869)
             })
+            
     except Exception as e:
         st.error(f"Network Error: Failed to fetch data from cloud. {e}")
         
-    return pd.DataFrame(data_list)
+    df = pd.DataFrame(data_list)
+    
+    if not df.empty:
+        df['lat_round'] = df['lat'].round(3)
+        df['lon_round'] = df['lon'].round(3)
+        cluster_counts = df.groupby(['lat_round', 'lon_round']).size()
+        
+        for idx, row in df.iterrows():
+            if cluster_counts.get((row['lat_round'], row['lon_round']), 0) >= 3 and row['Priority'] != 'P0':
+                df.at[idx, 'Priority'] = 'P0'
+                df.at[idx, '🤖 AI Intel'] = "⚠️ CLUSTER UPGRADE: " + str(row['🤖 AI Intel'])
+                
+        # Support for P-Review in sorting
+        prio_map = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P-Review": 4, "N/A": 5}
+        df['prio_val'] = df['Priority'].map(prio_map).fillna(99)
+        df = df.sort_values(by=['prio_val', 'wait_sec_hidden'], ascending=[True, False])
+        
+    return df
 
-# Styling function for dataframe rows based on Priority and Status
 def style_dataframe(row):
     status = str(row.get('Status', ''))
     if status in ['Rescued ✅', 'Resolved - Safe']:
@@ -253,27 +273,32 @@ def style_dataframe(row):
     elif prio == 'P2':
         return ['background-color: rgba(255, 236, 139, 0.15); color: #ffec8b'] * len(row) 
     elif prio == 'P3':
-        return ['background-color: rgba(139, 233, 253, 0.15); color: #8be9fd'] * len(row) 
+        return ['background-color: rgba(139, 233, 253, 0.15); color: #8be9fd'] * len(row)
+    # Apply purple color for P-Review manual intervention
+    elif prio == 'P-REVIEW':
+        return ['background-color: rgba(128, 0, 128, 0.25); color: #e0b0ff; font-weight: bold'] * len(row)
         
     return [''] * len(row)
-
 
 # --- SIDEBAR CONFIG ---
 with st.sidebar:
     st.header("🔐 Access Control")
     user_role = st.selectbox("Current Role", ["Admin / Commander", "Operator / Viewer"])
+    pause_refresh = st.checkbox("⏸️ Pause Live Updates (Action Mode)", value=False, help="Check this before selecting teams to prevent auto-refresh.")
     dynamic_sidebar = st.container()
 
-# --- FRAGMENT (Auto-refresh every 15 seconds) ---
-@st.fragment(run_every="15s")
+# --- FRAGMENT ---
+@st.fragment(run_every="30s") 
 def render_live_dashboard():
+    if pause_refresh:
+        st.warning("⏸️ Live updates are PAUSED. You can safely select units.")
+    
     rescue_df = get_cloud_data()
 
     df_pending = rescue_df[rescue_df['Status'].isin(['Pending Rescue', 'Pending', 'Awaiting'])].copy() if not rescue_df.empty else pd.DataFrame()
     df_active = rescue_df[rescue_df['Status'] == 'Sent/En Route'].copy() if not rescue_df.empty else pd.DataFrame()
     df_completed = rescue_df[rescue_df['Status'].isin(['Rescued ✅', 'Resolved - Safe'])].copy() if not rescue_df.empty else pd.DataFrame()
 
-    # --- DYNAMIC RESOURCES CALCULATION (Capacity Fix) ---
     if not df_active.empty and "🚨 Required Team" in df_active.columns:
         active_heli = len(df_active[df_active["🚨 Required Team"].str.contains("Heli|Evac", na=False, case=False)])
         active_boat = len(df_active[df_active["🚨 Required Team"].str.contains("Boat|Swift", na=False, case=False)])
@@ -299,15 +324,18 @@ def render_live_dashboard():
         st.divider()
 
     m1, m2, m3, m4 = st.columns(4)
-    total_sos = len(rescue_df)
-    critical_count = len(rescue_df[rescue_df["Priority"] == "P0"]) if total_sos > 0 else 0
-    m1.metric("🚨 Total Cases", str(total_sos))
+    # Calculate total cases using headcount sum
+    total_cases = int(rescue_df["Headcount"].sum()) if not rescue_df.empty and "Headcount" in rescue_df.columns else 0
+    critical_count = len(rescue_df[rescue_df["Priority"] == "P0"]) if not rescue_df.empty else 0
+    
+    m1.metric("🚨 Total Cases (Headcount)", str(total_cases))
     m2.metric("🆘 Critical (P0)", str(critical_count), delta_color="inverse")
     m3.metric("🚁 En Route", str(len(df_active)))
     m4.metric("✅ Rescued", str(len(df_completed)), delta_color="normal")
 
     if not rescue_df.empty:
-        full_csv = rescue_df.drop(columns=['Doc_ID']).to_csv(index=False).encode('utf-8')
+        export_df = rescue_df.drop(columns=['Doc_ID', 'prio_val', 'lat_round', 'lon_round', 'wait_sec_hidden'], errors='ignore')
+        full_csv = export_df.to_csv(index=False).encode('utf-8')
         st.download_button(label="📥 Export Full Audit Log", data=full_csv, file_name="ZAI_Mission_Report.csv", mime="text/csv")
 
     st.divider()
@@ -319,19 +347,17 @@ def render_live_dashboard():
 
     st.subheader("🚨 1. Pending Missions (Needs Dispatch)")
     if not df_pending.empty:
-        # Prevent jumpy checkboxes during refresh by pinning Doc_ID as index
         df_pending = df_pending.set_index("Doc_ID", drop=False)
         
-        offline_csv = df_pending.drop(columns=['Doc_ID']).to_csv(index=False).encode('utf-8')
+        offline_csv = df_pending.drop(columns=['Doc_ID', 'prio_val', 'lat_round', 'lon_round', 'wait_sec_hidden'], errors='ignore').to_csv(index=False).encode('utf-8')
         st.download_button(label="🖨️ Offline Backup (Pending)", data=offline_csv, file_name="ZAI_Offline_Pending.csv", mime="text/csv")
         
         df_pending.insert(0, "🚀 Deploy", False)
-        
         select_all_pending = st.checkbox("☑️ Select All Pending Missions", key="select_all_pending")
         if select_all_pending:
             df_pending["🚀 Deploy"] = True
         
-        view_columns = ["🚀 Deploy", "Priority", "Wait Time", "🚨 Required Team", "IC / ID", "Phone", "Location", "Hazards", "🤖 AI Intel", "📦 AI Supplies", "Doc_ID"]
+        view_columns = ["🚀 Deploy", "Priority", "Wait Time", "🚨 Required Team", "Headcount", "IC / ID", "Phone", "Location", "Hazards", "🤖 AI Intel", "📦 AI Supplies", "Doc_ID"]
         
         edited_pending = st.data_editor(
             df_pending[view_columns].style.apply(style_dataframe, axis=1),
@@ -340,7 +366,7 @@ def render_live_dashboard():
                 "🚀 Deploy": st.column_config.CheckboxColumn("Select", default=False),
                 "Doc_ID": None, 
             },
-            disabled=["Priority", "Wait Time", "🚨 Required Team", "IC / ID", "Phone", "Location", "Hazards", "🤖 AI Intel", "📦 AI Supplies"],
+            disabled=["Priority", "Wait Time", "🚨 Required Team", "Headcount", "IC / ID", "Phone", "Location", "Hazards", "🤖 AI Intel", "📦 AI Supplies"],
             use_container_width=True,
             height=300,
             key="pending_missions_table"
@@ -350,10 +376,10 @@ def render_live_dashboard():
         
         c1, c2 = st.columns([0.7, 0.3])
         with c1:
-            confirm_dispatch = st.checkbox("⚠️ I confirm these units are ready for deployment (Action cannot be easily undone)", key="conf_dispatch")
+            confirm_dispatch = st.checkbox("⚠️ I confirm these units are ready for deployment", key="conf_dispatch")
         with c2:
             btn_disabled = user_role != "Admin / Commander"
-            if st.button("🚀 Deploy Selected Teams", type="primary", disabled=btn_disabled, use_container_width=True):
+            if st.button("🚀 Deploy Required Teams", type="primary", disabled=btn_disabled, use_container_width=True):
                 if not confirm_dispatch:
                     st.warning("Please check the confirmation box before deploying.")
                 elif not selected_pending_docs:
@@ -361,18 +387,13 @@ def render_live_dashboard():
                 else:
                     with st.spinner("Checking capacity and transmitting dispatch orders..."):
                         try:
-                            # Triage by Priority for deployment queue
-                            priority_map = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-                            selected_rows = df_pending[df_pending["Doc_ID"].isin(selected_pending_docs)].copy()
-                            selected_rows["prio_val"] = selected_rows["Priority"].map(priority_map).fillna(99)
-                            selected_rows = selected_rows.sort_values("prio_val")
-
                             batch = db.batch()
                             timestamp_now = datetime.now(MY_TZ).strftime("%Y-%m-%d %H:%M:%S")
                             deployed_count, skipped_count = 0, 0
 
-                            for _, row in selected_rows.iterrows():
-                                req_team, doc_id, ic_val = row["🚨 Required Team"], row["Doc_ID"], row["IC / ID"]
+                            for doc_id in selected_pending_docs:
+                                row = df_pending.loc[doc_id]
+                                req_team, ic_val = row["🚨 Required Team"], row["IC / ID"]
 
                                 needs_heli = 1 if "Heli" in req_team or "Evac" in req_team else 0
                                 needs_boat = 1 if "Boat" in req_team or "Swift" in req_team else 0
@@ -398,7 +419,7 @@ def render_live_dashboard():
                             if skipped_count > 0: st.warning(f"⚠️ {skipped_count} missions delayed due to lack of units.")
                             st.rerun() 
                         except Exception as e:
-                            st.error("Failed to dispatch due to network or sync error.")
+                            st.error(f"Failed to dispatch due to network error: {str(e)}")
     else:
         st.info("✅ No pending rescue missions.")
 
@@ -413,7 +434,7 @@ def render_live_dashboard():
         if select_all_active:
             df_active["✅ Rescued"] = True
         
-        view_columns_active = ["✅ Rescued", "Priority", "Wait Time", "🚨 Required Team", "IC / ID", "Phone", "Location", "Notes", "🤖 AI Intel", "Doc_ID"]
+        view_columns_active = ["✅ Rescued", "Priority", "Wait Time", "🚨 Required Team", "Headcount", "IC / ID", "Phone", "Location", "Notes", "🤖 AI Intel", "Doc_ID"]
         
         edited_active = st.data_editor(
             df_active[view_columns_active].style.apply(style_dataframe, axis=1),
@@ -422,7 +443,7 @@ def render_live_dashboard():
                 "✅ Rescued": st.column_config.CheckboxColumn("Mark Safe", default=False),
                 "Doc_ID": None, 
             },
-            disabled=["Priority", "Wait Time", "🚨 Required Team", "IC / ID", "Phone", "Location", "Notes", "🤖 AI Intel"],
+            disabled=["Priority", "Wait Time", "🚨 Required Team", "Headcount", "IC / ID", "Phone", "Location", "Notes", "🤖 AI Intel"],
             use_container_width=True,
             height=300,
             key="active_missions_table"
@@ -465,7 +486,7 @@ def render_live_dashboard():
 
     with st.expander("✅ 3. Rescued Archive & AI Data Log"):
         if not df_completed.empty:
-            col_order_completed = ["IC / ID", "Phone", "Reported (MYT)", "Status", "Audit Timeline", "Location", "Hazards", "Medical", "🚨 Required Team"]
+            col_order_completed = ["IC / ID", "Phone", "Reported (MYT)", "Headcount", "Status", "Audit Timeline", "Location", "Hazards", "Medical", "🚨 Required Team"]
             st.dataframe(
                 df_completed.style.apply(style_dataframe, axis=1),
                 column_order=col_order_completed,
@@ -479,7 +500,7 @@ def render_live_dashboard():
 
     st.subheader("📍 Interactive Deployment Map")
     if not rescue_df.empty:
-        map_data = rescue_df[['IC / ID', 'lat', 'lon', 'Status', 'Priority', '🚨 Required Team']].copy()
+        map_data = rescue_df[['IC / ID', 'lat', 'lon', 'Status', 'Priority', '🚨 Required Team', 'Headcount']].copy()
         map_data = map_data.dropna(subset=['lat', 'lon'])
         
         def get_map_color(status):
@@ -491,7 +512,7 @@ def render_live_dashboard():
         layer = pdk.Layer('ScatterplotLayer', data=map_data, get_position='[lon, lat]', get_color='color_rgba', get_radius=300, pickable=True)
         avg_lat, avg_lon = map_data['lat'].mean() if not map_data.empty else 3.1390, map_data['lon'].mean() if not map_data.empty else 101.6869
         view_state = pdk.ViewState(latitude=avg_lat, longitude=avg_lon, zoom=11, pitch=0)
-        r = pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip={"text": "ID: {IC / ID}\nStatus: {Status}\nPriority: {Priority}\nTeam: {🚨 Required Team}"})
+        r = pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip={"text": "ID: {IC / ID}\nStatus: {Status}\nPriority: {Priority}\nHeadcount: {Headcount}\nTeam: {🚨 Required Team}"})
         st.pydeck_chart(r)
         st.markdown("""
         <div style="background-color: #161b22; padding: 15px; border-radius: 10px; border: 1px solid #30363d; font-size: 14px;">
