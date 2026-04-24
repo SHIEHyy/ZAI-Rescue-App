@@ -265,19 +265,17 @@ with st.sidebar:
     dynamic_sidebar = st.container()
 
 # --- FRAGMENT (Auto-refresh every 15 seconds) ---
-@st.fragment(run_every="15s")
-def render_live_dashboard():
-    rescue_df = get_cloud_data()
-
-    df_pending = rescue_df[rescue_df['Status'].isin(['Pending Rescue', 'Pending', 'Awaiting'])].copy() if not rescue_df.empty else pd.DataFrame()
-    df_active = rescue_df[rescue_df['Status'] == 'Sent/En Route'].copy() if not rescue_df.empty else pd.DataFrame()
-    df_completed = rescue_df[rescue_df['Status'].isin(['Rescued ✅', 'Resolved - Safe'])].copy() if not rescue_df.empty else pd.DataFrame()
-
-    # Calculate active units
+if not df_active.empty and "🚨 Required Team" in df_active.columns:
     active_heli = len(df_active[df_active["🚨 Required Team"].str.contains("Heli|Evac", na=False, case=False)])
     active_boat = len(df_active[df_active["🚨 Required Team"].str.contains("Boat|Swift", na=False, case=False)])
     active_medic = len(df_active[df_active["🚨 Required Team"].str.contains("ALS|BLS|Medic", na=False, case=False)])
     active_4x4 = len(df_active[df_active["🚨 Required Team"].str.contains("4x4", na=False, case=False)])
+else:
+    # If no one is active, default all counts to 0
+    active_heli = 0
+    active_boat = 0
+    active_medic = 0
+    active_4x4 = 0
 
     base_heli, base_boat, base_medic, base_4x4 = 3, 8, 6, 12
 
